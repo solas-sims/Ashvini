@@ -1,13 +1,59 @@
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import yaml
+
+
+@dataclass
+class PymctreesSourceParams:
+    """
+    basics.pymctrees in run_params.yaml -- only read when
+    basics.tree_source is 'pymctrees'. Cosmology, dm_model,
+    window_function_type etc. all live in the referenced pymctrees config
+    file, not here; this only covers the tree-building call itself (see
+    ashvini.pymctrees_adapter.build_forest_live, which takes exactly these
+    as arguments).
+    """
+    config: str          # path to a pymctrees YAML config, e.g. config/planck2018_camb.yml
+    n_halos: int = 100
+    z0: float = 5.0
+    z_max: float = 20.0
+    dz: float = 0.1
+    m_res: float = None  # Msun; None -> pymctrees_adapter's default (1e-3 * mass_bin)
+    backend: str = "numpy"
+    seed: int = None
+
+    def __post_init__(self):
+        # PyYAML's safe_load only parses bare-exponent numbers (1e10, or
+        # even 1.0e10 without an explicit +/- on the exponent) as floats
+        # if they also have a decimal point *and* an explicit sign on the
+        # exponent (e.g. 1.0e+10) -- a YAML 1.1 spec quirk. Plain "1e10"
+        # or "1e2" silently comes back as a str, which then blows up the
+        # first time it's used arithmetically (e.g. 1e-3 * mass_bin) --
+        # coerced explicitly here rather than trusting every future caller
+        # to defensively float()/int() it themselves.
+        self.n_halos = int(self.n_halos)
+        self.z0 = float(self.z0)
+        self.z_max = float(self.z_max)
+        self.dz = float(self.dz)
+        if self.m_res is not None:
+            self.m_res = float(self.m_res)
+        if self.seed is not None:
+            self.seed = int(self.seed)
 
 
 @dataclass
 class IOParams:
     mass_bin: float
-    tree_file: str
     dir_out: str
+    tree_source: str = "file"  # "file" (default, read tree_file) or "pymctrees" (generate live)
+    tree_file: str = None
+    pymctrees: PymctreesSourceParams = None
+
+    def __post_init__(self):
+        # See PymctreesSourceParams.__post_init__ -- same YAML bare-exponent
+        # gotcha applies to mass_bin (e.g. "mass_bin: 1e10" in
+        # run_params.yaml parses as the *string* '1e10', not a float).
+        self.mass_bin = float(self.mass_bin)
 
 
 @dataclass
@@ -47,6 +93,106 @@ class DustParams:
 
 
 @dataclass
+class Pop3Seeding:
+    enabled: bool
+    z_min: float
+    M_halo_min: float
+    Z_gas_max: float
+    M_seed: float
+
+
+@dataclass
+class DirectCollapseSeeding:
+    enabled: bool
+    z_min: float
+    M_halo_min: float
+    Z_gas_max: float
+    M_seed: float
+
+
+@dataclass
+class HaloMassThresholdSeeding:
+    enabled: bool
+    M_halo_min: float
+    M_seed: float
+
+
+@dataclass
+class SeedingParams:
+    pop3: Pop3Seeding
+    direct_collapse: DirectCollapseSeeding
+    halo_mass_threshold: HaloMassThresholdSeeding
+
+
+@dataclass
+class SigmaFeedbackParams:
+    """
+    black_holes.sigma_feedback -- optional isothermal-sphere M-sigma
+    self-regulation (King 2003, 2005; Power, Zubovas, Nayakshin & King 2011)
+    replacing the constant eta_agn AGN wind coupling with one that switches
+    on once M_BH crosses the self-regulation mass M_sigma(halo velocity
+    dispersion). See ashvini.black_holes_growth.velocity_dispersion/
+    m_sigma and ashvini.agn_feedback.coupling_switch, and MODELS.md's "AGN
+    feedback" section for the equations. Off by default: enabled=False
+    reproduces the prior constant-eta_agn behaviour exactly.
+    """
+    enabled: bool = False
+    f_g: float = 0.16       # baryon fraction relative to dark matter (King 2003; PZNK11)
+    kappa_es: float = None  # cm^2/g electron-scattering opacity; None -> sigma_thomson/m_p
+    transition_width: float = 0.1  # dex width of the smooth M_BH/M_sigma switch
+
+    # Hard growth cap at PZNK11's predicted M_BH ceiling (eq. 21-22):
+    # M_sigma * (1 + 0.41*sigma_200/h(z)). The paper does not give an
+    # explicit equation for *how* growth halts (their own words: "the most
+    # unclear part of any theory") -- only this bound on the eventual
+    # overshoot -- so a hard cutoff at the ceiling is a disclosed modelling
+    # choice, not something read off the paper directly. See
+    # black_holes_growth.growth_ceiling and MODELS.md's "AGN feedback"
+    # section. Requires sigma_feedback.enabled=True (the cap without the
+    # wind switch on is not a coherent self-regulation model). Off by
+    # default: without it, sigma_feedback is a wind-strength switch only
+    # (checked directly not to cap M_BH -- see
+    # tests/test_sigma_feedback.py::test_sigma_feedback_wind_alone_does_not_cap_bh_growth_near_m_sigma).
+    growth_cap_enabled: bool = False
+
+
+@dataclass
+class SlimDiskParams:
+    """
+    black_holes.slimdisk -- only read when black_holes.growth_model is
+    "hobbs_slimdisk" (see ashvini.black_holes_growth_slimdisk and
+    MODELS.md). Ported from the 2026 "Differential Growth" paper's
+    standalone prototype; see
+    docs/2026_paper_session_code_catalogue.md for provenance.
+    """
+    eta_acc: float = 0.005       # nuclear accretion efficiency (dimensionless)
+    R_nuc_pc: float = 100.0      # fixed nuclear radius for the free-fall estimate, pc
+    compaction_boost: float = 1.0  # fixed Phi_hat multiplier (>=1); see module docstring re: no time-varying/stochastic version here
+    r_crit: float = 8.0          # supply/standard-Eddington ratio threshold for the slim-disc cap to engage
+    epsilon_f: float = 5.0e-4    # King (2003) energy-driven AGN wind coupling
+    a_star: float = 0.5          # BH spin, via ashvini.spin.epsilon_from_spin -> radiative efficiency epsilon
+
+
+@dataclass
+class BlackHoleParams:
+    efficiency: float
+    eta_agn: float
+    seeding: SeedingParams
+    eddington_multiplier: float = 1.0  # f_Edd: allows super-Eddington growth if > 1
+    feedback_delay_time: float = 0.0   # Gyr; 0.0 = instantaneous AGN wind (default, matches prior behaviour)
+    sigma_feedback: SigmaFeedbackParams = field(default_factory=SigmaFeedbackParams)
+    # "pznk11_freefall" (default): the pre-existing model above (constant
+    # free-fall time, hard eddington_multiplier cap, eta_agn/M-sigma
+    # feedback). "hobbs_slimdisk": the 2026-paper alternative in
+    # ashvini.black_holes_growth_slimdisk (enclosed-mass free-fall,
+    # graded r_crit cap, King 2003 energy-driven feedback) -- see
+    # MODELS.md. Selecting "hobbs_slimdisk" does not change any default
+    # behaviour under "pznk11_freefall".
+    growth_model: str = "pznk11_freefall"
+    slimdisk: SlimDiskParams = field(default_factory=SlimDiskParams)
+
+
+@dataclass
 class Params:
     io: IOParams
     sf: StarFormationParams
@@ -54,20 +200,53 @@ class Params:
     reion: ReionizationParams
     metals: MetalsParams
     dust: DustParams
+    bh: BlackHoleParams
 
 
-def load_params() -> Params:
-    root = Path(__file__).resolve().parents[1]
-    config_file = root / "run_params.yaml"
-    raw = yaml.safe_load(config_file.read_text())
+def load_params(config_file=None) -> Params:
+    """
+    config_file : str or Path, optional
+        Defaults to the project root's run_params.yaml (the normal case,
+        used by the module-level PARAMS below). Overridable for testing
+        config-parsing logic against a temporary file without touching the
+        real one.
+    """
+    if config_file is None:
+        root = Path(__file__).resolve().parents[1]
+        config_file = root / "run_params.yaml"
+    raw = yaml.safe_load(Path(config_file).read_text())
+
+    basics = dict(raw["basics"])
+    pymctrees_raw = basics.pop("pymctrees", None)
 
     params = Params(
-        io=IOParams(**raw["basics"]),
+        io=IOParams(
+            **basics,
+            pymctrees=PymctreesSourceParams(**pymctrees_raw) if pymctrees_raw else None,
+        ),
         sf=StarFormationParams(**raw["star_formation"]),
         sn=SupernovaParams(**raw["supernova"]),
         reion=ReionizationParams(**raw["reionization"]),
         metals=MetalsParams(**raw["metallicity"]),
         dust=DustParams(**raw["dust"]),
+        bh=BlackHoleParams(
+            efficiency=raw["black_holes"]["efficiency"],
+            eta_agn=raw["black_holes"]["eta_agn"],
+            eddington_multiplier=raw["black_holes"].get("eddington_multiplier", 1.0),
+            feedback_delay_time=raw["black_holes"].get("feedback_delay_time", 0.0),
+            sigma_feedback=SigmaFeedbackParams(**raw["black_holes"].get("sigma_feedback", {})),
+            growth_model=raw["black_holes"].get("growth_model", "pznk11_freefall"),
+            slimdisk=SlimDiskParams(**raw["black_holes"].get("slimdisk", {})),
+            seeding=SeedingParams(
+                pop3=Pop3Seeding(**raw["black_holes"]["seeding"]["pop3"]),
+                direct_collapse=DirectCollapseSeeding(
+                    **raw["black_holes"]["seeding"]["direct_collapse"]
+                ),
+                halo_mass_threshold=HaloMassThresholdSeeding(
+                    **raw["black_holes"]["seeding"]["halo_mass_threshold"]
+                ),
+            ),
+        ),
     )
 
     return params
@@ -87,6 +266,7 @@ def print_config(params: Params):
     section("Reionization", asdict(params.reion))
     section("Metals", asdict(params.metals))
     section("Dust", asdict(params.dust))
+    section("Black Holes", asdict(params.bh))
 
 
 PARAMS = load_params()
